@@ -1,0 +1,61 @@
+[package]
+name = "coldstorage"
+version = "0.1.0"
+edition = "2021"
+description = "Neural photo cold storage — learned image compression CLI using Burn"
+
+[features]
+default = ["accelerate"]
+# Use Apple Accelerate BLAS for fast matrix multiplication (macOS only).
+# Disable with: cargo build --no-default-features
+accelerate = ["burn-ndarray/blas-accelerate"]
+
+[dependencies]
+# Deep learning framework
+burn = { version = "0.16", features = ["ndarray", "wgpu", "autodiff"] }
+# Re-export to enable BLAS feature for NdArray backend
+burn-ndarray = { version = "0.16" }
+
+# Entropy coding for learned compression
+constriction = "0.4"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Image processing
+image = "0.25"
+
+# EXIF extraction
+kamadak-exif = "0.5"
+
+# Hashing
+sha2 = "0.10"
+
+# Time
+chrono = "0.4"
+
+# Progress bars
+indicatif = "0.17"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+
+# Byte order for blob format
+byteorder = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Numeric utilities
+num-traits = "0.2"
+
+# Direct ndarray access for fast conv (must match burn-ndarray's version)
+ndarray = "0.16"
