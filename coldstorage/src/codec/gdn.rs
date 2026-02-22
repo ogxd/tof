@@ -35,11 +35,11 @@ pub struct GdnConfig {
 #[derive(Module, Debug)]
 pub struct Gdn<B: Backend> {
     /// Reparametrized beta — shape [channels].
-    beta_reparam: Param<Tensor<B, 1>>,
+    pub beta_reparam: Param<Tensor<B, 1>>,
     /// Reparametrized gamma — shape [channels, channels].
-    gamma_reparam: Param<Tensor<B, 2>>,
+    pub gamma_reparam: Param<Tensor<B, 2>>,
     /// Whether to compute inverse (IGDN).
-    inverse: bool,
+    pub inverse: bool,
 }
 
 impl GdnConfig {
@@ -63,9 +63,11 @@ impl<B: Backend> Gdn<B> {
     ///
     /// Input shape: [batch, channels, height, width]
     /// Output shape: same as input.
+    ///
+    /// Computes: y_i = x_i / sqrt(beta_i + sum_j(gamma_ij * x_j²))  (GDN)
+    ///       or: y_i = x_i * sqrt(beta_i + sum_j(gamma_ij * x_j²))  (IGDN)
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let [_batch, channels, _height, _width] = x.dims();
-        let device = x.device();
+        let [batch, channels, height, width] = x.dims();
 
         // Derive positive parameters
         let beta_val = self.beta_reparam.val();
@@ -74,23 +76,17 @@ impl<B: Backend> Gdn<B> {
         let gamma_val = self.gamma_reparam.val();
         let gamma = gamma_val.clone() * gamma_val; // [C, C]
 
-        // Use diagonal of gamma (per-channel self-interaction) to avoid the
-        // O(C^2 * H * W) matmul.  This is a standard simplification used in
-        // efficient GDN implementations.
-        let gamma_data: Vec<f32> = gamma
-            .reshape([channels * channels])
-            .into_data()
-            .to_vec()
-            .unwrap_or_default();
-        let diag_vals: Vec<f32> = (0..channels)
-            .map(|i| gamma_data[i * channels + i])
-            .collect();
-        let gamma_diag = Tensor::<B, 1>::from_floats(diag_vals.as_slice(), &device);
-
-        // gamma_diag [C] → [1, C, 1, 1] for automatic broadcasting against [B, C, H, W]
-        let gamma_4d = gamma_diag.reshape([1, channels, 1, 1]);
+        // Full gamma matmul: norm_i = sum_j(gamma_ij * x_j²)
+        // x_sq: [B, C, H, W] → [B, C, H*W]
         let x_sq = x.clone() * x.clone();
-        let weighted = x_sq * gamma_4d;
+        let x_sq_flat = x_sq.reshape([batch, channels, height * width]);
+
+        // gamma: [C, C] → [1, C, C] for broadcasting over batch
+        let gamma_3d = gamma.unsqueeze::<3>(); // [1, C, C]
+
+        // matmul: [1, C, C] × [B, C, H*W] → [B, C, H*W]
+        let weighted_flat = gamma_3d.matmul(x_sq_flat);
+        let weighted = weighted_flat.reshape([batch, channels, height, width]);
 
         // beta [C] → [1, C, 1, 1] for automatic broadcasting
         let beta_4d = beta.reshape([1, channels, 1, 1]);

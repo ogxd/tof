@@ -1,15 +1,15 @@
 //! bmshj2018 Hyperprior model — Ballé, Minnen, Singh, Hwang, Johnston (2018).
 //!
-//! Architecture:
+//! Architecture (ScaleHyperprior):
 //!
 //!   Encoder  (g_a): image → latents y
 //!   Decoder  (g_s): quantized latents ŷ → reconstructed image
 //!   Hyper-encoder (h_a): y → hyper-latents z
-//!   Hyper-decoder (h_s): quantized z̃ → Gaussian params (mean, scale) for y
+//!   Hyper-decoder (h_s): quantized z̃ → scale parameters for y
 //!
 //! The entropy model:
 //!   - z is coded with a learned factorized prior (per-channel CDF tables).
-//!   - y is coded with a Gaussian conditional whose (mean, scale) come from h_s(z̃).
+//!   - y is coded with a zero-mean Gaussian conditional whose scale comes from h_s(z̃).
 
 use burn::config::Config;
 use burn::module::Module;
@@ -30,13 +30,13 @@ pub struct AnalysisTransformConfig {
 
 #[derive(Module, Debug)]
 pub struct AnalysisTransform<B: Backend> {
-    conv1: Conv2d<B>,
-    gdn1: Gdn<B>,
-    conv2: Conv2d<B>,
-    gdn2: Gdn<B>,
-    conv3: Conv2d<B>,
-    gdn3: Gdn<B>,
-    conv4: Conv2d<B>,
+    pub conv1: Conv2d<B>,
+    pub gdn1: Gdn<B>,
+    pub conv2: Conv2d<B>,
+    pub gdn2: Gdn<B>,
+    pub conv3: Conv2d<B>,
+    pub gdn3: Gdn<B>,
+    pub conv4: Conv2d<B>,
 }
 
 impl AnalysisTransformConfig {
@@ -84,13 +84,13 @@ pub struct SynthesisTransformConfig {
 
 #[derive(Module, Debug)]
 pub struct SynthesisTransform<B: Backend> {
-    deconv1: ConvTranspose2d<B>,
-    igdn1: Gdn<B>,
-    deconv2: ConvTranspose2d<B>,
-    igdn2: Gdn<B>,
-    deconv3: ConvTranspose2d<B>,
-    igdn3: Gdn<B>,
-    deconv4: ConvTranspose2d<B>,
+    pub deconv1: ConvTranspose2d<B>,
+    pub igdn1: Gdn<B>,
+    pub deconv2: ConvTranspose2d<B>,
+    pub igdn2: Gdn<B>,
+    pub deconv3: ConvTranspose2d<B>,
+    pub igdn3: Gdn<B>,
+    pub deconv4: ConvTranspose2d<B>,
 }
 
 impl SynthesisTransformConfig {
@@ -142,9 +142,9 @@ pub struct HyperAnalysisConfig {
 
 #[derive(Module, Debug)]
 pub struct HyperAnalysis<B: Backend> {
-    conv1: Conv2d<B>,
-    conv2: Conv2d<B>,
-    conv3: Conv2d<B>,
+    pub conv1: Conv2d<B>,
+    pub conv2: Conv2d<B>,
+    pub conv3: Conv2d<B>,
 }
 
 impl HyperAnalysisConfig {
@@ -184,41 +184,39 @@ pub struct HyperSynthesisConfig {
 
 #[derive(Module, Debug)]
 pub struct HyperSynthesis<B: Backend> {
-    deconv1: ConvTranspose2d<B>,
-    deconv2: ConvTranspose2d<B>,
-    deconv3: ConvTranspose2d<B>,
+    pub deconv1: ConvTranspose2d<B>,
+    pub deconv2: ConvTranspose2d<B>,
+    pub conv3: Conv2d<B>,
 }
 
 impl HyperSynthesisConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> HyperSynthesis<B> {
-        // h_s: N → M → M*3/2 → M*2
-        let mid = self.m * 3 / 2;
+        // h_s: N → N → N → M (ScaleHyperprior: last layer is Conv2d, outputs scales only)
         HyperSynthesis {
-            deconv1: ConvTranspose2dConfig::new([self.n, self.m], [5, 5])
+            deconv1: ConvTranspose2dConfig::new([self.n, self.n], [5, 5])
                 .with_stride([2, 2])
                 .with_padding([2, 2])
                 .with_padding_out([1, 1])
                 .init(device),
-            deconv2: ConvTranspose2dConfig::new([self.m, mid], [5, 5])
+            deconv2: ConvTranspose2dConfig::new([self.n, self.n], [5, 5])
                 .with_stride([2, 2])
                 .with_padding([2, 2])
                 .with_padding_out([1, 1])
                 .init(device),
-            deconv3: ConvTranspose2dConfig::new([mid, self.m * 2], [3, 3])
+            conv3: Conv2dConfig::new([self.n, self.m], [3, 3])
                 .with_stride([1, 1])
-                .with_padding([1, 1])
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
                 .init(device),
         }
     }
 }
 
 impl<B: Backend + ConvDispatch> HyperSynthesis<B> {
-    /// Forward pass. Returns a tensor of shape [B, M*2, H, W] where the first M
-    /// channels are the predicted means and the last M channels are the log-scales.
+    /// Forward pass. Returns a tensor of shape [B, M, H, W] — predicted scales for y.
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = burn::tensor::activation::relu(conv_transpose2d_forward(&self.deconv1, x));
         let x = burn::tensor::activation::relu(conv_transpose2d_forward(&self.deconv2, x));
-        conv_transpose2d_forward(&self.deconv3, x)
+        burn::tensor::activation::relu(conv2d_forward(&self.conv3, x))
     }
 }
 
@@ -270,10 +268,10 @@ impl<B: Backend + ConvDispatch> Hyperprior<B> {
     /// Encode an image tensor into quantized latents and hyper-latents.
     ///
     /// Input: [1, 3, H, W] image tensor (H, W must be multiples of 64).
-    /// Returns: (y_quantized, z_quantized, gaussian_params)
+    /// Returns: (y_quantized, z_quantized, scales)
     ///   - y_quantized: [1, M, H/16, W/16] — quantized latents
     ///   - z_quantized: [1, N, H/64, W/64] — quantized hyper-latents
-    ///   - gaussian_params: [1, 2*M, H/16, W/16] — (means, scales) from h_s
+    ///   - scales: [1, M, H/16, W/16] — predicted scales from h_s
     pub fn encode(
         &self,
         x: Tensor<B, 4>,
@@ -281,9 +279,9 @@ impl<B: Backend + ConvDispatch> Hyperprior<B> {
         let y = self.g_a.forward(x);
         let z = self.h_a.forward(y.clone());
         let z_hat = quantize(&z);
-        let gaussian_params = self.h_s.forward(z_hat.clone());
+        let scales_hat = self.h_s.forward(z_hat.clone());
         let y_hat = quantize(&y);
-        (y_hat, z_hat, gaussian_params)
+        (y_hat, z_hat, scales_hat)
     }
 
     /// Decode quantized latents back to an image.
@@ -296,7 +294,7 @@ impl<B: Backend + ConvDispatch> Hyperprior<B> {
 
     /// Full forward pass (for training): image → reconstructed image + likelihoods.
     ///
-    /// Returns (x_hat, y, z, gaussian_params) for computing rate-distortion loss.
+    /// Returns (x_hat, y, z, scales_hat) for computing rate-distortion loss.
     pub fn forward(
         &self,
         x: Tensor<B, 4>,
@@ -304,24 +302,23 @@ impl<B: Backend + ConvDispatch> Hyperprior<B> {
         let y = self.g_a.forward(x);
         let z = self.h_a.forward(y.clone());
         let z_hat = quantize_with_noise(&z);
-        let gaussian_params = self.h_s.forward(z_hat.clone());
+        let scales_hat = self.h_s.forward(z_hat.clone());
         let y_hat = quantize_with_noise(&y);
         let x_hat = self.g_s.forward(y_hat);
-        (x_hat, y, z, gaussian_params)
+        (x_hat, y, z, scales_hat)
     }
 
     /// Extract Gaussian (mean, scale) from the hyper-synthesis output.
     ///
-    /// The h_s output has shape [B, 2*M, H, W]. First M channels = means,
-    /// last M channels = log-scales → exp to get scales.
+    /// For the ScaleHyperprior, h_s outputs [B, M, H, W] = scales only.
+    /// Means are zero (zero-mean Gaussian conditional).
+    /// Scales are clamped to [0.01, 100.0].
     pub fn split_gaussian_params(
         &self,
-        params: &Tensor<B, 4>,
+        scales_hat: &Tensor<B, 4>,
     ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        let [b, _, h, w] = params.dims();
-        let means = params.clone().slice([0..b, 0..self.m, 0..h, 0..w]);
-        let log_scales = params.clone().slice([0..b, self.m..self.m * 2, 0..h, 0..w]);
-        let scales = log_scales.exp().clamp(0.01, 100.0);
+        let means = Tensor::zeros(scales_hat.dims(), &scales_hat.device());
+        let scales = scales_hat.clone().clamp(0.01, 100.0);
         (means, scales)
     }
 }

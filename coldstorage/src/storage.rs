@@ -22,6 +22,10 @@ pub struct ColdStorage<B: Backend + ConvDispatch> {
     db: Database,
     model: Hyperprior<B>,
     device: B::Device,
+    /// PMF tables for z entropy coding (factorized prior).
+    z_pmf_tables: Vec<Vec<f64>>,
+    /// Per-channel offsets for z entropy coding.
+    z_offsets: Vec<i32>,
 }
 
 impl<B: Backend + ConvDispatch> ColdStorage<B> {
@@ -44,13 +48,37 @@ impl<B: Backend + ConvDispatch> ColdStorage<B> {
             config.model,
             config.quality
         );
-        let model = codec::create_model::<B>(config.model, config.quality, &device);
+        let resolved_weights = match config.resolve_weights_dir() {
+            Some(dir) => {
+                eprintln!("  weights: {}", dir.display());
+                Some(dir)
+            }
+            None => {
+                eprintln!("  No pretrained weights found — downloading...");
+                match config.auto_export_weights() {
+                    Ok(dir) => Some(dir),
+                    Err(e) => {
+                        eprintln!("  WARNING: auto-download failed: {e:#}");
+                        eprintln!("  Falling back to random init (output will be garbage)");
+                        eprintln!("  To fix: pip install compressai torch numpy");
+                        None
+                    }
+                }
+            }
+        };
+        let (model, z_pmf_tables, z_offsets) = codec::create_model::<B>(
+            config.model,
+            config.quality,
+            resolved_weights.as_deref(),
+            &device,
+        )?;
         eprintln!("Model loaded");
 
         // Save model info
         let model_info = serde_json::json!({
             "name": config.model.as_str(),
             "quality": config.quality,
+            "weights": resolved_weights.as_ref().map(|p| p.display().to_string()),
             "loaded_at": chrono::Utc::now().to_rfc3339(),
         });
         let info_path = config.models_dir().join("model_info.json");
@@ -62,6 +90,8 @@ impl<B: Backend + ConvDispatch> ColdStorage<B> {
             db,
             model,
             device,
+            z_pmf_tables,
+            z_offsets,
         })
     }
 
@@ -91,7 +121,7 @@ impl<B: Backend + ConvDispatch> ColdStorage<B> {
         // Compress
         eprintln!("  encoding...");
         let t1 = std::time::Instant::now();
-        let blob = codec::compress(&self.model, prepared.tensor.clone())?;
+        let blob = codec::compress(&self.model, prepared.tensor.clone(), &self.z_pmf_tables, &self.z_offsets)?;
         eprintln!("  compressed in {:.1}s", t1.elapsed().as_secs_f64());
         let blob_bytes = blob.to_bytes()?;
         let compressed_size = blob_bytes.len() as u64;
@@ -112,7 +142,7 @@ impl<B: Backend + ConvDispatch> ColdStorage<B> {
         let psnr = if self.config.compute_metrics {
             eprintln!("  decoding for metrics...");
             let t_dec = std::time::Instant::now();
-            let reconstructed = codec::decompress(&self.model, &blob, &self.device)?;
+            let reconstructed = codec::decompress(&self.model, &blob, &self.device, &self.z_pmf_tables, &self.z_offsets)?;
             eprintln!("  decoded in {:.1}s", t_dec.elapsed().as_secs_f64());
             // Unpad for fair comparison
             let orig_unpadded =
@@ -225,7 +255,7 @@ impl<B: Backend + ConvDispatch> ColdStorage<B> {
         let blob = CompressedBlob::from_bytes(&blob_bytes)?;
 
         // Decompress
-        let reconstructed = codec::decompress(&self.model, &blob, &self.device)?;
+        let reconstructed = codec::decompress(&self.model, &blob, &self.device, &self.z_pmf_tables, &self.z_offsets)?;
 
         // Remove padding
         let unpadded = image_utils::unpad(&reconstructed, record.pad_h, record.pad_w);

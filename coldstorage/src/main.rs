@@ -57,6 +57,10 @@ enum Commands {
         /// Compute device (cpu or gpu). GPU uses Metal on macOS.
         #[arg(long, default_value = "cpu", value_enum)]
         device: DeviceKind,
+
+        /// Path to pretrained weights directory (exported .npy files).
+        #[arg(long)]
+        weights: Option<PathBuf>,
     },
 
     /// Reconstruct a photo from cold storage.
@@ -83,6 +87,10 @@ enum Commands {
         /// Compute device (cpu or gpu).
         #[arg(long, default_value = "cpu", value_enum)]
         device: DeviceKind,
+
+        /// Path to pretrained weights directory (exported .npy files).
+        #[arg(long)]
+        weights: Option<PathBuf>,
     },
 
     /// Show compression statistics for the vault.
@@ -192,6 +200,7 @@ fn main() -> Result<()> {
             metrics,
             max_dim,
             device,
+            weights,
         } => {
             let config = ColdStorageConfig {
                 storage_dir: storage,
@@ -200,6 +209,7 @@ fn main() -> Result<()> {
                 max_dim,
                 compute_metrics: metrics,
                 device,
+                weights_dir: weights,
             };
             match device {
                 DeviceKind::Cpu => {
@@ -219,11 +229,13 @@ fn main() -> Result<()> {
             quality,
             model,
             device,
+            weights,
         } => {
             let config = ColdStorageConfig {
                 storage_dir: storage,
                 model,
                 quality,
+                weights_dir: weights,
                 ..Default::default()
             };
             match device {

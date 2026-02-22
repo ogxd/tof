@@ -6,6 +6,9 @@ pub mod entropy;
 pub mod fast_conv;
 pub mod gdn;
 pub mod hyperprior;
+pub mod weights;
+
+use std::path::Path;
 
 use anyhow::Result;
 use burn::prelude::*;
@@ -20,18 +23,47 @@ use self::hyperprior::{Hyperprior, HyperpriorConfig};
 ///
 /// Takes an image tensor [1, 3, H, W] in [0, 1] (H, W must be multiples of 64)
 /// and returns a `CompressedBlob` containing entropy-coded latent streams.
+///
+/// `z_pmf_tables` and `z_offsets` define the factorized prior for hyper-latents z.
 pub fn compress<B: Backend + ConvDispatch>(
     model: &Hyperprior<B>,
     image: Tensor<B, 4>,
+    z_pmf_tables: &[Vec<f64>],
+    z_offsets: &[i32],
 ) -> Result<CompressedBlob> {
-    let (y_hat, z_hat, gaussian_params) = model.encode(image);
+    let (y_hat, z_hat, _) = model.encode(image);
 
     let [_, y_c, y_h, y_w] = y_hat.dims();
+    let [_, z_c, z_h, z_w] = z_hat.dims();
+
+    // Step 1: Entropy-encode z with factorized prior
+    let z_data: Vec<f32> = z_hat
+        .reshape([z_c * z_h * z_w])
+        .into_data()
+        .to_vec()
+        .map_err(|e| anyhow::anyhow!("z_hat conversion failed: {e:?}"))?;
+    let z_symbols: Vec<i32> = z_data.iter().map(|&v| v.round() as i32).collect();
+
+    let channel_indices: Vec<usize> = (0..z_c)
+        .flat_map(|c| std::iter::repeat_n(c, z_h * z_w))
+        .collect();
+
+    let z_stream = entropy::factorized_encode(&z_symbols, &channel_indices, z_pmf_tables, z_offsets)?;
+
+    // Step 2: Decode z back to get the CLAMPED z values (matching what the decoder will see)
+    let z_clamped_symbols =
+        entropy::factorized_decode(&z_stream, z_symbols.len(), &channel_indices, z_pmf_tables, z_offsets)?;
+    let z_clamped_data: Vec<f32> = z_clamped_symbols.iter().map(|&s| s as f32).collect();
+    let z_clamped = Tensor::<B, 1>::from_floats(z_clamped_data.as_slice(), &y_hat.device())
+        .reshape([1, z_c, z_h, z_w]);
+
+    // Step 3: Compute scales from CLAMPED z (this matches what decoder will compute)
+    let gaussian_params = model.h_s.forward(z_clamped);
     let (means, scales) = model.split_gaussian_params(&gaussian_params);
     let [_, means_c, _, _] = means.dims();
     let [_, scales_c, _, _] = scales.dims();
 
-    // Flatten tensors to vectors for entropy coding
+    // Step 4: Entropy-encode y using the scales derived from clamped z
     let y_flat_len = y_c * y_h * y_w;
     let y_data: Vec<f32> = y_hat
         .reshape([y_flat_len])
@@ -56,41 +88,7 @@ pub fn compress<B: Backend + ConvDispatch>(
         .map_err(|e| anyhow::anyhow!("scales conversion failed: {e:?}"))?;
     let scales_f64: Vec<f64> = scales_data.iter().map(|&v| v as f64).collect();
 
-    // Entropy-encode y with Gaussian conditional
     let y_stream = entropy::gaussian_encode(&y_symbols, &means_f64, &scales_f64)?;
-
-    // Entropy-encode z with factorized prior
-    let [_, z_c, z_h, z_w] = z_hat.dims();
-    let z_data: Vec<f32> = z_hat
-        .reshape([z_c * z_h * z_w])
-        .into_data()
-        .to_vec()
-        .map_err(|e| anyhow::anyhow!("z_hat conversion failed: {e:?}"))?;
-    let z_symbols: Vec<i32> = z_data.iter().map(|&v| v.round() as i32).collect();
-
-    let channel_indices: Vec<usize> = (0..z_c)
-        .flat_map(|c| std::iter::repeat_n(c, z_h * z_w))
-        .collect();
-
-    // Build simple factorized prior PMF tables (Laplacian approximation as default)
-    let cdf_tables: Vec<Vec<f64>> = (0..z_c)
-        .map(|_| {
-            let mut pmf = vec![0.0f64; 256];
-            // Peaked Laplacian centered at 0 (index 128)
-            for (i, p) in pmf.iter_mut().enumerate() {
-                let val = i as f64 - 128.0;
-                *p = (-val.abs() / 2.0).exp();
-            }
-            let sum: f64 = pmf.iter().sum();
-            for p in &mut pmf {
-                *p /= sum;
-                *p = p.max(1e-10);
-            }
-            pmf
-        })
-        .collect();
-
-    let z_stream = entropy::factorized_encode(&z_symbols, &channel_indices, &cdf_tables)?;
 
     Ok(CompressedBlob {
         latent_shape: (y_h as u32, y_w as u32),
@@ -99,10 +97,14 @@ pub fn compress<B: Backend + ConvDispatch>(
 }
 
 /// Decompress a `CompressedBlob` back to an image tensor [1, 3, H, W].
+///
+/// `z_pmf_tables` and `z_offsets` define the factorized prior for hyper-latents z.
 pub fn decompress<B: Backend + ConvDispatch>(
     model: &Hyperprior<B>,
     blob: &CompressedBlob,
     device: &B::Device,
+    z_pmf_tables: &[Vec<f64>],
+    z_offsets: &[i32],
 ) -> Result<Tensor<B, 4>> {
     let (y_h, y_w) = (blob.latent_shape.0 as usize, blob.latent_shape.1 as usize);
 
@@ -120,24 +122,8 @@ pub fn decompress<B: Backend + ConvDispatch>(
         .flat_map(|c| std::iter::repeat_n(c, z_h * z_w))
         .collect();
 
-    let cdf_tables: Vec<Vec<f64>> = (0..model.n)
-        .map(|_| {
-            let mut pmf = vec![0.0f64; 256];
-            for (i, p) in pmf.iter_mut().enumerate() {
-                let val = i as f64 - 128.0;
-                *p = (-val.abs() / 2.0).exp();
-            }
-            let sum: f64 = pmf.iter().sum();
-            for p in &mut pmf {
-                *p /= sum;
-                *p = p.max(1e-10);
-            }
-            pmf
-        })
-        .collect();
-
     let z_symbols =
-        entropy::factorized_decode(z_stream, num_z_symbols, &channel_indices, &cdf_tables)?;
+        entropy::factorized_decode(z_stream, num_z_symbols, &channel_indices, z_pmf_tables, z_offsets)?;
 
     // Reconstruct z tensor
     let z_data: Vec<f32> = z_symbols.iter().map(|&s| s as f32).collect();
@@ -181,13 +167,38 @@ pub fn decompress<B: Backend + ConvDispatch>(
     Ok(model.decode(y_hat))
 }
 
-/// Create a hyperprior model for the given quality level.
+/// Create a hyperprior model, optionally loading pretrained weights.
+///
+/// Returns the model along with entropy bottleneck PMF tables and offsets for z coding.
+/// If `weights_dir` is None, uses random init with a Laplacian fallback prior.
 pub fn create_model<B: Backend + ConvDispatch>(
     _arch: ModelArch,
     quality: u8,
+    weights_dir: Option<&Path>,
     device: &B::Device,
-) -> Hyperprior<B> {
-    // Currently only hyperprior is implemented.
-    // Other architectures can be added here.
-    HyperpriorConfig::new(quality).init(device)
+) -> Result<(Hyperprior<B>, Vec<Vec<f64>>, Vec<i32>)> {
+    if let Some(dir) = weights_dir {
+        weights::load_pretrained(dir, quality, device)
+    } else {
+        let model = HyperpriorConfig::new(quality).init(device);
+        let n = model.n;
+        // Fallback: Laplacian PMF tables for random init
+        let pmf_tables: Vec<Vec<f64>> = (0..n)
+            .map(|_| {
+                let mut pmf = vec![0.0f64; 256];
+                for (i, p) in pmf.iter_mut().enumerate() {
+                    let val = i as f64 - 128.0;
+                    *p = (-val.abs() / 2.0).exp();
+                }
+                let sum: f64 = pmf.iter().sum();
+                for p in &mut pmf {
+                    *p /= sum;
+                    *p = p.max(1e-10);
+                }
+                pmf
+            })
+            .collect();
+        let offsets: Vec<i32> = vec![-128; n];
+        Ok((model, pmf_tables, offsets))
+    }
 }

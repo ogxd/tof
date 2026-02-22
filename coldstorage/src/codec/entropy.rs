@@ -19,6 +19,13 @@ use constriction::stream::model::DefaultContiguousCategoricalEntropyModel;
 use constriction::stream::stack::DefaultAnsCoder;
 use constriction::stream::{Decode, Encode};
 
+/// Symbol range for Gaussian conditional coding.
+/// Must be wide enough to cover all quantized latent values.
+const GAUSSIAN_MIN: i32 = -256;
+const GAUSSIAN_MAX: i32 = 255;
+const GAUSSIAN_OFFSET: i32 = -GAUSSIAN_MIN; // index = symbol + offset
+const GAUSSIAN_NUM_SYMBOLS: usize = (GAUSSIAN_MAX - GAUSSIAN_MIN + 1) as usize;
+
 /// Quantize a (mean, scale) pair into a cache key.
 ///
 /// We bucket mean to the nearest 0.5 and scale to the nearest 0.25.
@@ -43,7 +50,7 @@ fn get_or_build_model(
     // Reconstruct the quantized mean/scale from the key
     let q_mean = key.0 as f64 / 2.0;
     let q_scale = (key.1 as f64 / 4.0).max(0.01);
-    let pmf = quantized_gaussian_pmf(q_mean, q_scale, -128, 127);
+    let pmf = quantized_gaussian_pmf(q_mean, q_scale, GAUSSIAN_MIN, GAUSSIAN_MAX);
     let model = DefaultContiguousCategoricalEntropyModel
         ::from_floating_point_probabilities_fast(&pmf, None)
         .map_err(|_| anyhow::anyhow!("failed to build entropy model for mean={q_mean}, scale={q_scale}"))?;
@@ -65,7 +72,7 @@ pub fn gaussian_encode(symbols: &[i32], means: &[f64], scales: &[f64]) -> Result
     // Encode in reverse order (ANS is a stack / LIFO)
     for i in (0..symbols.len()).rev() {
         let model = get_or_build_model(&mut model_cache, means[i], scales[i])?;
-        let sym = (symbols[i] + 128).clamp(0, 255) as usize;
+        let sym = (symbols[i] + GAUSSIAN_OFFSET).clamp(0, GAUSSIAN_NUM_SYMBOLS as i32 - 1) as usize;
         coder
             .encode_symbol(sym, model)
             .map_err(|e| anyhow::anyhow!("failed to encode symbol {i}: {e:?}"))?;
@@ -112,7 +119,7 @@ pub fn gaussian_decode(
         let sym = coder
             .decode_symbol(model)
             .map_err(|e| anyhow::anyhow!("failed to decode symbol {i}: {e:?}"))?;
-        symbols.push(sym as i32 - 128);
+        symbols.push(sym as i32 - GAUSSIAN_OFFSET);
     }
 
     Ok(symbols)
@@ -121,12 +128,14 @@ pub fn gaussian_decode(
 /// Entropy-encode symbols using a factorized (non-parametric) prior.
 ///
 /// `cdf_tables[c]` contains the PMF for channel `c`.
+/// `offsets[c]` is the minimum symbol value for channel `c` (symbol index = symbol - offset).
 /// `symbols` are the quantized latent values, flattened in C,H,W order.
 /// `channel_indices[i]` indicates which channel symbol `i` belongs to.
 pub fn factorized_encode(
     symbols: &[i32],
     channel_indices: &[usize],
     cdf_tables: &[Vec<f64>],
+    offsets: &[i32],
 ) -> Result<Vec<u8>> {
     let mut coder = DefaultAnsCoder::new();
 
@@ -143,7 +152,8 @@ pub fn factorized_encode(
 
     for i in (0..symbols.len()).rev() {
         let ch = channel_indices[i];
-        let sym = (symbols[i] + 128).clamp(0, 255) as usize;
+        let num_symbols = cdf_tables[ch].len();
+        let sym = (symbols[i] - offsets[ch]).clamp(0, num_symbols as i32 - 1) as usize;
         coder
             .encode_symbol(sym, models[ch].clone())
             .map_err(|e| anyhow::anyhow!("failed to encode factorized symbol {i}: {e:?}"))?;
@@ -157,11 +167,14 @@ pub fn factorized_encode(
 }
 
 /// Entropy-decode symbols using a factorized prior.
+///
+/// `offsets[c]` is the minimum symbol value for channel `c` (symbol = index + offset).
 pub fn factorized_decode(
     data: &[u8],
     num_symbols: usize,
     channel_indices: &[usize],
     cdf_tables: &[Vec<f64>],
+    offsets: &[i32],
 ) -> Result<Vec<i32>> {
     if !data.len().is_multiple_of(4) {
         bail!("ANS data length {} is not a multiple of 4", data.len());
@@ -192,7 +205,7 @@ pub fn factorized_decode(
         let sym = coder
             .decode_symbol(models[ch].clone())
             .map_err(|e| anyhow::anyhow!("failed to decode factorized symbol {i}: {e:?}"))?;
-        symbols.push(sym as i32 - 128);
+        symbols.push(sym as i32 + offsets[ch]);
     }
 
     Ok(symbols)
@@ -253,21 +266,22 @@ mod tests {
 
     #[test]
     fn gaussian_pmf_sums_to_one() {
-        let pmf = quantized_gaussian_pmf(0.0, 1.0, -128, 127);
+        let pmf = quantized_gaussian_pmf(0.0, 1.0, GAUSSIAN_MIN, GAUSSIAN_MAX);
         let sum: f64 = pmf.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn gaussian_pmf_peaked_at_mean() {
-        let pmf = quantized_gaussian_pmf(5.0, 2.0, -128, 127);
+        let pmf = quantized_gaussian_pmf(5.0, 2.0, GAUSSIAN_MIN, GAUSSIAN_MAX);
         let peak_idx = pmf
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .unwrap()
             .0;
-        assert_eq!(peak_idx, 133); // mean=5 maps to index 133
+        // mean=5 maps to index 5 - GAUSSIAN_MIN = 5 + 256 = 261
+        assert_eq!(peak_idx, (5 - GAUSSIAN_MIN) as usize);
     }
 
     #[test]

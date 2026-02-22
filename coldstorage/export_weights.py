@@ -16,9 +16,19 @@ Requirements:
 import argparse
 import json
 import os
+import ssl
 
 import numpy as np
 import torch
+
+# Fix SSL certificate verification on macOS (common with Python installed via python.org)
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except ImportError:
+    # Fallback: use unverified context if certifi is not available
+    if hasattr(ssl, "_create_unverified_context"):
+        ssl._create_default_https_context = ssl._create_unverified_context
 
 from compressai.zoo import (
     bmshj2018_hyperprior,
