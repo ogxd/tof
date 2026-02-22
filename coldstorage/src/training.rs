@@ -226,7 +226,7 @@ pub fn finetune(
         config.epochs, config.lr, config.lambda
     );
     eprintln!("  Corpus: {} images", images.len());
-    eprintln!("  Note: training uses Burn's standard conv (slower than inference).");
+    eprintln!("  Note: training uses tensor im2col + BLAS matmul (autodiff-compatible).");
     eprintln!();
 
     let mut best_loss = f64::INFINITY;

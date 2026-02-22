@@ -45,17 +45,18 @@ impl ConvDispatch for Wgpu {
     }
 }
 
-/// Autodiff<NdArray> — falls back to Burn's built-in conv (differentiable, slower).
+/// Autodiff<NdArray> — uses tensor-based im2col + matmul (BLAS-accelerated AND differentiable).
 ///
-/// The fast im2col+GEMM path in NdArray operates on raw ndarray internals and
-/// does not record operations in the autodiff graph.  For training we need
-/// Burn's standard conv which is fully tracked by the autodiff tape.
+/// The raw ndarray fast path in `conv2d_ndarray` bypasses the autodiff tape.
+/// This impl does im2col using Burn tensor slicing, then `Tensor::matmul()` which
+/// routes through NdArray → ndarray → BLAS. All operations are tracked by autodiff
+/// so gradients flow correctly.
 impl ConvDispatch for burn::backend::Autodiff<NdArray> {
     fn conv2d_fwd(conv: &Conv2d<Self>, input: Tensor<Self, 4>) -> Tensor<Self, 4> {
-        conv.forward(input)
+        conv2d_tensor(conv, input)
     }
     fn conv_t2d_fwd(conv: &ConvTranspose2d<Self>, input: Tensor<Self, 4>) -> Tensor<Self, 4> {
-        conv.forward(input)
+        conv_t2d_tensor(conv, input)
     }
 }
 
@@ -347,4 +348,270 @@ fn conv_t2d_ndarray(conv: &ConvTranspose2d<NdArray>, input: Tensor<NdArray, 4>) 
     }
 
     result
+}
+
+// ── Tensor-based im2col Conv2d (any backend, autodiff-compatible) ──────────
+//
+// Restructures convolution as im2col → matmul.  All operations use Burn tensor
+// ops, so the autodiff tape records every step.  The matmul still routes to
+// BLAS on NdArray (via Autodiff<NdArray>), giving most of the speed benefit
+// of the raw ndarray path while keeping full gradient support.
+
+/// im2col via tensor slicing: for each kernel position (ky, kx), slice the
+/// input at the correct stride/padding offsets and stack along the channel dim.
+///
+/// Input:  [B, C_in, H, W]  (already padded if needed)
+/// Output: [B, C_in * kH * kW, out_H * out_W]
+fn tensor_im2col<B: Backend>(
+    input: &Tensor<B, 4>,
+    kh: usize, kw: usize,
+    sh: usize, sw: usize,
+    out_h: usize, out_w: usize,
+) -> Tensor<B, 3> {
+    let [batch, c_in, _h, _w] = input.dims();
+
+    // Collect one [B, C_in, out_H, out_W] slice per kernel element
+    let mut columns: Vec<Tensor<B, 4>> = Vec::with_capacity(kh * kw);
+
+    for ky in 0..kh {
+        for kx in 0..kw {
+            // For each output row oh: input row = oh*sh + ky
+            // For each output col ow: input col = ow*sw + kx
+            // We need out_h rows starting at ky, stepping by sh
+            // and out_w cols starting at kx, stepping by sw
+
+            // Build index ranges for the input slice
+            let row_end = ky + (out_h - 1) * sh + 1;
+            let col_end = kx + (out_w - 1) * sw + 1;
+
+            // Slice the full range then subsample by stride
+            let patch = input.clone().slice([0..batch, 0..c_in, ky..row_end, kx..col_end]);
+
+            // Subsample by stride if stride > 1
+            let patch = if sh > 1 || sw > 1 {
+                // Use narrow slicing: take every sh-th row and sw-th col
+                // Burn doesn't have stride-slice, so we gather using Tensor ops.
+                // For our model's strides (1 or 2), this is efficient.
+                stride_subsample(&patch, sh, sw, out_h, out_w)
+            } else {
+                patch
+            };
+
+            columns.push(patch); // [B, C_in, out_H, out_W]
+        }
+    }
+
+    // Stack: [kH*kW] × [B, C_in, out_H, out_W] → [B, C_in * kH*kW, out_H * out_W]
+    // First cat along dim=1 (channels): [B, C_in * kH * kW, out_H, out_W]
+    let stacked = Tensor::cat(columns, 1);
+    let total_k = c_in * kh * kw;
+    stacked.reshape([batch, total_k, out_h * out_w])
+}
+
+/// Subsample a tensor by strides (sh, sw) along the spatial dims.
+/// Uses `Tensor::select` — a single indexed-gather per dimension (no per-pixel loops).
+///
+/// Input: [B, C, H', W'] where H' >= (out_h-1)*sh+1, W' >= (out_w-1)*sw+1
+/// Output: [B, C, out_h, out_w]
+fn stride_subsample<B: Backend>(
+    x: &Tensor<B, 4>,
+    sh: usize, sw: usize,
+    out_h: usize, out_w: usize,
+) -> Tensor<B, 4> {
+    if sh == 1 && sw == 1 {
+        return x.clone();
+    }
+
+    let device = x.device();
+    let mut result = x.clone();
+
+    if sh > 1 {
+        let indices: Vec<i32> = (0..out_h).map(|i| (i * sh) as i32).collect();
+        let idx = Tensor::<B, 1, Int>::from_ints(indices.as_slice(), &device);
+        result = result.select(2, idx);
+    }
+
+    if sw > 1 {
+        let indices: Vec<i32> = (0..out_w).map(|i| (i * sw) as i32).collect();
+        let idx = Tensor::<B, 1, Int>::from_ints(indices.as_slice(), &device);
+        result = result.select(3, idx);
+    }
+
+    result
+}
+
+/// Conv2d using tensor-based im2col + matmul.  Works on any backend.
+fn conv2d_tensor<B: Backend>(conv: &Conv2d<B>, input: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [batch, _c_in, h, w] = input.dims();
+    let weight = conv.weight.val();
+    let [c_out, c_in_k, kh, kw] = weight.dims();
+    let [sh, sw] = conv.stride;
+    let (ph, pw) = resolve_padding(&conv.padding, kh, kw);
+
+    let out_h = (h + 2 * ph - kh) / sh + 1;
+    let out_w = (w + 2 * pw - kw) / sw + 1;
+
+    // Pad input if needed
+    let padded = if ph > 0 || pw > 0 {
+        let device = input.device();
+        let padded_h = h + 2 * ph;
+        let padded_w = w + 2 * pw;
+        let mut padded = Tensor::<B, 4>::zeros([batch, _c_in, padded_h, padded_w], &device);
+        padded = padded.slice_assign(
+            [0..batch, 0.._c_in, ph..ph + h, pw..pw + w],
+            input,
+        );
+        padded
+    } else {
+        input
+    };
+
+    // im2col: [B, C_in*kH*kW, out_H*out_W]
+    let col = tensor_im2col(&padded, kh, kw, sh, sw, out_h, out_w);
+
+    // Weight: [C_out, C_in, kH, kW] → permute to [C_out, kH, kW, C_in] → reshape to [C_out, kH*kW*C_in]
+    // This matches tensor_im2col's column ordering: (ky, kx, c_in) per patch.
+    let col_k = c_in_k * kh * kw;
+    let w_perm = weight.swap_dims(1, 2).swap_dims(2, 3); // [C_out, kH, kW, C_in]
+    let w_2d = w_perm.reshape([c_out, col_k]);
+
+    // GEMM: [C_out, C_in*kH*kW] × [B, C_in*kH*kW, out_H*out_W]
+    // Expand weight to batch dim: [1, C_out, col_k] → broadcast
+    let w_3d = w_2d.unsqueeze::<3>(); // [1, C_out, col_k]
+    let result = w_3d.matmul(col); // [B, C_out, out_H*out_W]
+
+    // Reshape to [B, C_out, out_H, out_W]
+    let mut output = result.reshape([batch, c_out, out_h, out_w]);
+
+    // Add bias
+    if let Some(ref bias) = conv.bias {
+        let bias_4d = bias.val().reshape([1, c_out, 1, 1]);
+        output = output + bias_4d;
+    }
+
+    output
+}
+
+/// Upsample by inserting (stride-1) zeros between elements along spatial dims.
+///
+/// Uses interleave-via-reshape: no loops, O(1) tensor ops.
+///
+/// Input:  [B, C, H, W]
+/// Output: [B, C, (H-1)*sh+1, (W-1)*sw+1]
+fn upsample_zeros<B: Backend>(input: Tensor<B, 4>, sh: usize, sw: usize) -> Tensor<B, 4> {
+    if sh == 1 && sw == 1 {
+        return input;
+    }
+
+    let [batch, c, h, w] = input.dims();
+    let device = input.device();
+    let up_h = (h - 1) * sh + 1;
+    let up_w = (w - 1) * sw + 1;
+
+    // Upsample columns: interleave each value with (sw-1) zeros
+    // [B,C,H,W] → unsqueeze → [B,C,H,W,1] cat zeros → [B,C,H,W,sw] → reshape → [B,C,H,W*sw] → trim
+    let x = if sw > 1 {
+        let x: Tensor<B, 5> = input.unsqueeze_dim(4);                         // [B,C,H,W,1]
+        let z = Tensor::<B, 5>::zeros([batch, c, h, w, sw - 1], &device);     // [B,C,H,W,sw-1]
+        let x = Tensor::cat(vec![x, z], 4);                                   // [B,C,H,W,sw]
+        let x = x.reshape([batch, c, h, w * sw]);                             // [B,C,H,W*sw]
+        x.slice([0..batch, 0..c, 0..h, 0..up_w])                             // [B,C,H,up_w]
+    } else {
+        input
+    };
+
+    // Upsample rows: same trick along dim 2
+    if sh > 1 {
+        let [_, _, h2, w2] = x.dims();
+        let x: Tensor<B, 5> = x.unsqueeze_dim(3);                             // [B,C,H,1,W']
+        let z = Tensor::<B, 5>::zeros([batch, c, h2, sh - 1, w2], &device);   // [B,C,H,sh-1,W']
+        let x = Tensor::cat(vec![x, z], 3);                                   // [B,C,H,sh,W']
+        let x = x.reshape([batch, c, h2 * sh, w2]);                           // [B,C,H*sh,W']
+        x.slice([0..batch, 0..c, 0..up_h, 0..w2])                            // [B,C,up_h,W']
+    } else {
+        x
+    }
+}
+
+/// ConvTranspose2d using upsample + im2col + matmul.  Works on any backend.
+///
+/// Strategy: ConvTranspose2d(x, W, stride=S, padding=P) is equivalent to:
+///   1. Upsample x by inserting (S-1) zeros between elements
+///   2. Conv2d(upsampled, flip(W^T), stride=1, padding=kH-1-P)
+///
+/// This avoids the problematic col2im scatter loop entirely.
+fn conv_t2d_tensor<B: Backend>(conv: &ConvTranspose2d<B>, input: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [batch, c_in, h_in, w_in] = input.dims();
+    let weight = conv.weight.val(); // [C_in, C_out, kH, kW]
+    let [_c_in_w, c_out, kh, kw] = weight.dims();
+    let [sh, sw] = conv.stride;
+    let [po_h, po_w] = conv.padding_out;
+    let [ph, pw] = conv.padding;
+
+    let out_h = (h_in - 1) * sh - 2 * ph + kh + po_h;
+    let out_w = (w_in - 1) * sw - 2 * pw + kw + po_w;
+
+    // 1. Upsample: insert (stride-1) zeros between input elements
+    let upsampled = upsample_zeros(input, sh, sw);
+
+    // 1b. Add output_padding extra zeros at the end of the upsampled input.
+    //     This is the correct way to handle output_padding in the upsample equivalence:
+    //     the conv kernel must operate on those positions (not just append zeros to output).
+    let upsampled = if po_h > 0 || po_w > 0 {
+        let [_, _, uh, uw] = upsampled.dims();
+        let ext_h = uh + po_h;
+        let ext_w = uw + po_w;
+        let device = upsampled.device();
+        let mut ext = Tensor::<B, 4>::zeros([batch, c_in, ext_h, ext_w], &device);
+        ext = ext.slice_assign([0..batch, 0..c_in, 0..uh, 0..uw], upsampled);
+        ext
+    } else {
+        upsampled
+    };
+
+    let [_, _, up_h, up_w] = upsampled.dims();
+
+    // 2. Flip weight spatially and transpose channel dims
+    //    [C_in, C_out, kH, kW] → [C_out, C_in, kH, kW] with kernel reversed
+    let w_transposed = weight.swap_dims(0, 1);  // [C_out, C_in, kH, kW]
+    let w_flipped = w_transposed.flip([2, 3]);   // reverse spatial dims
+
+    // 3. Equivalent conv2d padding: (kH-1-P) for each spatial dim
+    let conv_ph = kh - 1 - ph;
+    let conv_pw = kw - 1 - pw;
+
+    // 4. Pad upsampled input for the equivalent conv2d
+    let padded = if conv_ph > 0 || conv_pw > 0 {
+        let device = upsampled.device();
+        let padded_h = up_h + 2 * conv_ph;
+        let padded_w = up_w + 2 * conv_pw;
+        let mut p = Tensor::<B, 4>::zeros([batch, c_in, padded_h, padded_w], &device);
+        p = p.slice_assign(
+            [0..batch, 0..c_in, conv_ph..conv_ph + up_h, conv_pw..conv_pw + up_w],
+            upsampled,
+        );
+        p
+    } else {
+        upsampled
+    };
+
+    // 5. im2col + matmul (stride=1, since stride is handled by upsampling)
+    let col = tensor_im2col(&padded, kh, kw, 1, 1, out_h, out_w);
+
+    // Permute to [C_out, kH, kW, C_in] to match tensor_im2col's (ky, kx, c_in) ordering
+    let col_k = c_in * kh * kw;
+    let w_perm = w_flipped.swap_dims(1, 2).swap_dims(2, 3); // [C_out, kH, kW, C_in]
+    let w_2d = w_perm.reshape([c_out, col_k]);
+    let w_3d = w_2d.unsqueeze::<3>(); // [1, C_out, col_k]
+    let result = w_3d.matmul(col);     // [B, C_out, out_H * out_W]
+
+    let mut output = result.reshape([batch, c_out, out_h, out_w]);
+
+    // 7. Add bias
+    if let Some(ref bias) = conv.bias {
+        let bias_4d = bias.val().reshape([1, c_out, 1, 1]);
+        output = output + bias_4d;
+    }
+
+    output
 }
