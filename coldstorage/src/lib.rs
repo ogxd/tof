@@ -5,3 +5,4 @@ pub mod db;
 pub mod image_utils;
 pub mod metrics;
 pub mod storage;
+pub mod training;

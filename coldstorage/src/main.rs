@@ -141,17 +141,25 @@ enum Commands {
         #[arg(long, default_value_t = 1e-4)]
         lr: f64,
 
-        /// Rate-distortion trade-off (lambda).
+        /// Rate-distortion trade-off (lambda). Higher = more compression, lower quality.
         #[arg(long, default_value_t = 0.01)]
         lambda: f64,
 
-        /// Quality level.
+        /// Quality level (determines model size / pretrained weights).
         #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(1..=8))]
         quality: u8,
 
         /// Compression model architecture.
         #[arg(long, default_value = "hyperprior", value_enum)]
         model: ModelArch,
+
+        /// Maximum image dimension for training crops.
+        #[arg(long, default_value_t = 512)]
+        max_dim: u32,
+
+        /// Path to pretrained weights directory (exported .npy files).
+        #[arg(long)]
+        weights: Option<PathBuf>,
     },
 }
 
@@ -288,21 +296,73 @@ fn main() -> Result<()> {
             lambda,
             quality,
             model,
+            max_dim,
+            weights,
         } => {
-            let _ = (epochs, lr, lambda);
+            use coldstorage::training;
+
+            // Resolve weights
             let config = ColdStorageConfig {
-                storage_dir: storage,
+                storage_dir: storage.clone(),
                 model,
                 quality,
+                max_dim,
+                weights_dir: weights,
                 ..Default::default()
             };
-            let _engine = ColdStorage::<NdArray>::new(config, Default::default())?;
-            // TODO: implement fine-tuning with Burn's autodiff backend
-            eprintln!(
-                "Fine-tuning not yet implemented. \
-                 (epochs={epochs}, lr={lr}, lambda={lambda})"
-            );
-            eprintln!("This will use Burn's Autodiff<NdArray> backend for training.");
+            config.validate()?;
+
+            eprintln!("Loading model: {} (quality={})", config.model, config.quality);
+            let resolved_weights = match config.resolve_weights_dir() {
+                Some(dir) => {
+                    eprintln!("  weights: {}", dir.display());
+                    Some(dir)
+                }
+                None => {
+                    eprintln!("  No pretrained weights found — downloading...");
+                    match config.auto_export_weights() {
+                        Ok(dir) => Some(dir),
+                        Err(e) => {
+                            eprintln!("  WARNING: auto-download failed: {e:#}");
+                            eprintln!("  Starting from random init");
+                            None
+                        }
+                    }
+                }
+            };
+
+            // Fine-tune
+            let ft_config = training::FinetuneConfig {
+                epochs,
+                lr,
+                lambda,
+                max_dim,
+                quality,
+                model_arch: model,
+            };
+
+            let trained = training::finetune(
+                &ft_config,
+                resolved_weights.as_deref(),
+                &storage,
+            )?;
+
+            // Save fine-tuned model weights
+            let save_dir = storage.join("models").join("finetuned");
+            std::fs::create_dir_all(&save_dir)?;
+            eprintln!("Saving fine-tuned model to: {}", save_dir.display());
+
+            // Use Burn's built-in record system
+            use burn::record::{BinFileRecorder, FullPrecisionSettings};
+            let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+            trained
+                .save_file(save_dir.join("hyperprior"), &recorder)
+                .map_err(|e| anyhow::anyhow!("failed to save model: {e}"))?;
+
+            eprintln!("Fine-tuned model saved.");
+            eprintln!();
+            eprintln!("To use the fine-tuned model, load it with --weights (Burn format).");
+            eprintln!("Re-ingest your photos to get improved compression on your corpus.");
         }
     }
 

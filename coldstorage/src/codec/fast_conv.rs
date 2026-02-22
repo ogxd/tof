@@ -45,6 +45,20 @@ impl ConvDispatch for Wgpu {
     }
 }
 
+/// Autodiff<NdArray> — falls back to Burn's built-in conv (differentiable, slower).
+///
+/// The fast im2col+GEMM path in NdArray operates on raw ndarray internals and
+/// does not record operations in the autodiff graph.  For training we need
+/// Burn's standard conv which is fully tracked by the autodiff tape.
+impl ConvDispatch for burn::backend::Autodiff<NdArray> {
+    fn conv2d_fwd(conv: &Conv2d<Self>, input: Tensor<Self, 4>) -> Tensor<Self, 4> {
+        conv.forward(input)
+    }
+    fn conv_t2d_fwd(conv: &ConvTranspose2d<Self>, input: Tensor<Self, 4>) -> Tensor<Self, 4> {
+        conv.forward(input)
+    }
+}
+
 /// Convenience wrapper: dispatches to fast NdArray path or Burn fallback.
 pub fn conv2d_forward<B: ConvDispatch>(conv: &Conv2d<B>, input: Tensor<B, 4>) -> Tensor<B, 4> {
     B::conv2d_fwd(conv, input)
